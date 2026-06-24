@@ -344,14 +344,36 @@ class AudioSaveHelper:
             else:  # format == "flac":
                 out_stream = output_container.add_stream("flac", rate=sample_rate, layout=layout)
 
-            frame = av.AudioFrame.from_ndarray(
-                waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
-                format="flt",
-                layout=layout,
-            )
-            frame.sample_rate = sample_rate
-            frame.pts = 0
-            output_container.mux(out_stream.encode(frame))
+            waveform_np = waveform.float().numpy()
+            total_samples = waveform_np.shape[1]
+            frame_size = out_stream.codec_context.frame_size
+
+            if frame_size and frame_size > 0:
+                for offset in range(0, total_samples, frame_size):
+                    chunk = waveform_np[:, offset:offset + frame_size]
+                    actual_size = chunk.shape[1]
+                    if actual_size < frame_size:
+                        padding = np.zeros((chunk.shape[0], frame_size - actual_size), dtype=chunk.dtype)
+                        chunk = np.concatenate([chunk, padding], axis=1)
+
+                    chunk_interleaved = np.ascontiguousarray(np.transpose(chunk).reshape(1, -1))
+                    frame = av.AudioFrame.from_ndarray(
+                        chunk_interleaved,
+                        format="flt",
+                        layout=layout,
+                    )
+                    frame.sample_rate = sample_rate
+                    frame.pts = offset
+                    output_container.mux(out_stream.encode(frame))
+            else:
+                frame = av.AudioFrame.from_ndarray(
+                    waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
+                    format="flt",
+                    layout=layout,
+                )
+                frame.sample_rate = sample_rate
+                frame.pts = 0
+                output_container.mux(out_stream.encode(frame))
 
             # Flush encoder
             output_container.mux(out_stream.encode(None))

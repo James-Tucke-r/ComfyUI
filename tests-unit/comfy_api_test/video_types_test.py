@@ -237,3 +237,97 @@ def test_duration_consistency(video_components):
     manual_duration = float(components.images.shape[0] / components.frame_rate)
 
     assert duration == pytest.approx(manual_duration)
+
+
+def test_video_save_with_large_audio(sample_images):
+    """Test saving a video with audio that exceeds single frame size limits (e.g. > 1024 samples)"""
+    large_audio = AudioInput(
+        {
+            "waveform": torch.rand(1, 2, 5000),
+            "sample_rate": 44100,
+        }
+    )
+    components = VideoComponents(
+        images=sample_images,
+        audio=large_audio,
+        frame_rate=Fraction(30),
+    )
+    video = VideoFromComponents(components)
+    
+    buffer = io.BytesIO()
+    # This should succeed without avcodec_send_frame error 22
+    video.save_to(buffer)
+    buffer.seek(0)
+    
+    with av.open(buffer, mode="r") as container:
+        assert len(container.streams.video) == 1
+        assert len(container.streams.audio) == 1
+        audio_stream = container.streams.audio[0]
+        assert audio_stream.codec_context.name == "aac"
+
+
+def test_video_save_with_nan_inf_audio(sample_images):
+    """Test saving a video with audio that contains NaN, Inf, and out-of-range values"""
+    waveform = torch.rand(1, 2, 5000)
+    waveform[0, 0, 100] = float('nan')
+    waveform[0, 1, 200] = float('inf')
+    waveform[0, 0, 300] = -float('inf')
+    waveform[0, 1, 400] = 5.0
+    waveform[0, 0, 500] = -10.0
+
+    bad_audio = AudioInput(
+        {
+            "waveform": waveform,
+            "sample_rate": 44100,
+        }
+    )
+    components = VideoComponents(
+        images=sample_images,
+        audio=bad_audio,
+        frame_rate=Fraction(30),
+    )
+    video = VideoFromComponents(components)
+    
+    buffer = io.BytesIO()
+    # This should succeed and sanitize the values without throwing an avcodec error 22
+    video.save_to(buffer)
+    buffer.seek(0)
+    
+    with av.open(buffer, mode="r") as container:
+        assert len(container.streams.video) == 1
+        assert len(container.streams.audio) == 1
+        audio_stream = container.streams.audio[0]
+        assert audio_stream.codec_context.name == "aac"
+
+
+def test_video_save_with_corrupt_audio_fallback(sample_images, monkeypatch):
+    """Test saving a video where audio encoding raises an exception, ensuring it falls back to video-only saving"""
+    large_audio = AudioInput(
+        {
+            "waveform": torch.rand(1, 2, 5000),
+            "sample_rate": 44100,
+        }
+    )
+    components = VideoComponents(
+        images=sample_images,
+        audio=large_audio,
+        frame_rate=Fraction(30),
+    )
+    video = VideoFromComponents(components)
+    
+    buffer = io.BytesIO()
+    
+    # Mock from_ndarray to raise ArgumentError (simulating returned 22)
+    def mock_from_ndarray(*args, **kwargs):
+        raise av.error.ArgumentError(22, "Invalid argument: 'avcodec_send_frame()' returned 22")
+        
+    monkeypatch.setattr("comfy_api.latest._input_impl.video_types.av.AudioFrame.from_ndarray", mock_from_ndarray)
+    
+    # This should succeed even if the audio encoding raises ArgumentError, and log the error
+    video.save_to(buffer)
+    buffer.seek(0)
+    
+    with av.open(buffer, mode="r") as container:
+        assert len(container.streams.video) == 1
+        assert len(container.streams.audio) == 0
+

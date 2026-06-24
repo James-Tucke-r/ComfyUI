@@ -239,16 +239,40 @@ def audio_ndarray_to_bytesio(
     audio_bytes_io = BytesIO()
     with av.open(audio_bytes_io, mode="w", format=container_format) as output_container:
         audio_stream = output_container.add_stream(codec_name, rate=sample_rate)
-        frame = av.AudioFrame.from_ndarray(
-            audio_data_np,
-            format="fltp",
-            layout="stereo" if audio_data_np.shape[0] > 1 else "mono",
-        )
-        frame.sample_rate = sample_rate
-        frame.pts = 0
+        layout = "stereo" if audio_data_np.shape[0] > 1 else "mono"
+        
+        total_samples = audio_data_np.shape[1]
+        frame_size = audio_stream.codec_context.frame_size
 
-        for packet in audio_stream.encode(frame):
-            output_container.mux(packet)
+        if frame_size and frame_size > 0:
+            for offset in range(0, total_samples, frame_size):
+                chunk = audio_data_np[:, offset:offset + frame_size]
+                actual_size = chunk.shape[1]
+                if actual_size < frame_size:
+                    padding = np.zeros((chunk.shape[0], frame_size - actual_size), dtype=chunk.dtype)
+                    chunk = np.concatenate([chunk, padding], axis=1)
+
+                frame = av.AudioFrame.from_ndarray(
+                    chunk,
+                    format="fltp",
+                    layout=layout,
+                )
+                frame.sample_rate = sample_rate
+                frame.pts = offset
+
+                for packet in audio_stream.encode(frame):
+                    output_container.mux(packet)
+        else:
+            frame = av.AudioFrame.from_ndarray(
+                audio_data_np,
+                format="fltp",
+                layout=layout,
+            )
+            frame.sample_rate = sample_rate
+            frame.pts = 0
+
+            for packet in audio_stream.encode(frame):
+                output_container.mux(packet)
 
         # Flush stream
         for packet in audio_stream.encode(None):
@@ -285,22 +309,47 @@ def audio_tensor_to_contiguous_ndarray(waveform: torch.Tensor) -> np.ndarray:
 
 
 def audio_input_to_mp3(audio: Input.Audio) -> BytesIO:
-    waveform = audio["waveform"].cpu()
+    waveform = audio["waveform"].cpu()[0]
+    sample_rate = audio["sample_rate"]
+    layout = "mono" if waveform.shape[0] == 1 else "stereo"
 
     output_buffer = BytesIO()
     output_container = av.open(output_buffer, mode="w", format="mp3")
 
-    out_stream = output_container.add_stream("libmp3lame", rate=audio["sample_rate"])
+    out_stream = output_container.add_stream("libmp3lame", rate=sample_rate)
     out_stream.bit_rate = 320000
 
-    frame = av.AudioFrame.from_ndarray(
-        waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
-        format="flt",
-        layout="mono" if waveform.shape[0] == 1 else "stereo",
-    )
-    frame.sample_rate = audio["sample_rate"]
-    frame.pts = 0
-    output_container.mux(out_stream.encode(frame))
+    waveform_np = waveform.float().numpy()
+    total_samples = waveform_np.shape[1]
+    frame_size = out_stream.codec_context.frame_size
+
+    if frame_size and frame_size > 0:
+        for offset in range(0, total_samples, frame_size):
+            chunk = waveform_np[:, offset:offset + frame_size]
+            actual_size = chunk.shape[1]
+            if actual_size < frame_size:
+                padding = np.zeros((chunk.shape[0], frame_size - actual_size), dtype=chunk.dtype)
+                chunk = np.concatenate([chunk, padding], axis=1)
+
+            chunk_interleaved = np.ascontiguousarray(np.transpose(chunk).reshape(1, -1))
+            frame = av.AudioFrame.from_ndarray(
+                chunk_interleaved,
+                format="flt",
+                layout=layout,
+            )
+            frame.sample_rate = sample_rate
+            frame.pts = offset
+            output_container.mux(out_stream.encode(frame))
+    else:
+        frame = av.AudioFrame.from_ndarray(
+            np.ascontiguousarray(np.transpose(waveform_np).reshape(1, -1)),
+            format="flt",
+            layout=layout,
+        )
+        frame.sample_rate = sample_rate
+        frame.pts = 0
+        output_container.mux(out_stream.encode(frame))
+
     output_container.mux(out_stream.encode(None))
     output_container.close()
     output_buffer.seek(0)

@@ -10,6 +10,7 @@ if args.list_feature_flags:
     raise SystemExit(0)
 
 import os
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 import importlib.util
 import shutil
 import importlib.metadata
